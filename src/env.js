@@ -5,6 +5,10 @@ const schema = z.object({
   PORT: z.string().optional(),
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
 
+  BAGS_PARTNER_WALLET: z.string().min(32).optional(),
+  BAGS_PARTNER_CONFIG: z.string().min(10).optional(),
+
+  
   // Bags
   BAGS_API_KEY: z.string().min(1, 'BAGS_API_KEY is required'),
 
