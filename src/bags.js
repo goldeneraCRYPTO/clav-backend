@@ -3,6 +3,10 @@ const FormData = require('form-data');
 
 const BAGS_API_BASE = 'https://public-api-v2.bags.fm/api/v1';
 
+// Optional partner fee settings (safe defaults: disabled if not provided)
+const BAGS_PARTNER_WALLET = (process.env.BAGS_PARTNER_WALLET || '').trim();
+const BAGS_PARTNER_CONFIG = (process.env.BAGS_PARTNER_CONFIG || '').trim();
+
 function bagsClient(apiKey) {
   const client = axios.create({
     baseURL: BAGS_API_BASE,
@@ -21,19 +25,21 @@ async function getFeeShareWallet(client, { provider, username }) {
   return resp.data?.response?.wallet;
 }
 
-async function createTokenInfo(client, {
-  name,
-  symbol,
-  description,
-  imageUrl,
-  website,
-  twitter,
-  telegram,
-  metadataUrl,
-  imageFileBuffer,
-  imageFileName,
-}) {
-  // Docs: multipart/form-data with optional image OR imageUrl. citeturn1view1
+async function createTokenInfo(
+  client,
+  {
+    name,
+    symbol,
+    description,
+    imageUrl,
+    website,
+    twitter,
+    telegram,
+    metadataUrl,
+    imageFileBuffer,
+    imageFileName,
+  }
+) {
   const fd = new FormData();
   if (imageFileBuffer) {
     fd.append('image', imageFileBuffer, imageFileName || 'logo.png');
@@ -55,20 +61,17 @@ async function createTokenInfo(client, {
   const tokenMint = resp.data?.response?.tokenMint;
   const tokenMetadata = resp.data?.response?.tokenMetadata;
   if (!tokenMint || !tokenMetadata) {
-    throw new Error(`Unexpected create-token-info response: ${JSON.stringify(resp.data).slice(0, 600)}`);
+    throw new Error(
+      `Unexpected create-token-info response: ${JSON.stringify(resp.data).slice(0, 600)}`
+    );
   }
 
   return { tokenMint, tokenMetadata, raw: resp.data };
 }
 
-async function createFeeShareConfig(client, {
-  payer,
-  baseMint,
-  claimers,
-}) {
-  // Docs: POST /fee-share/config, returns configKey and txs. citeturn1view2
-  const claimersArray = claimers.map(c => c.wallet);
-  const basisPointsArray = claimers.map(c => c.bps);
+async function createFeeShareConfig(client, { payer, baseMint, claimers }) {
+  const claimersArray = claimers.map((c) => c.wallet);
+  const basisPointsArray = claimers.map((c) => c.bps);
 
   const resp = await client.post('/fee-share/config', {
     payer,
@@ -77,37 +80,46 @@ async function createFeeShareConfig(client, {
     basisPointsArray,
   });
 
-  // Bags responses vary slightly; handle common fields
   const r = resp.data?.response || resp.data;
   const configKey = r?.configKey || r?.meteoraConfigKey;
   const transactions = r?.transactions || [];
 
   if (!configKey) {
-    throw new Error(`No configKey in fee-share response: ${JSON.stringify(resp.data).slice(0, 600)}`);
+    throw new Error(
+      `No configKey in fee-share response: ${JSON.stringify(resp.data).slice(0, 600)}`
+    );
   }
 
   return { configKey, transactions, raw: resp.data };
 }
 
-async function createLaunchTx(client, {
-  ipfs,
-  tokenMint,
-  wallet,
-  configKey,
-  initialBuyLamports = 0,
-}) {
-  // Docs: Create launch transaction returns base58 tx. citeturn1view3
-  const resp = await client.post('/token-launch/create-launch-transaction', {
+async function createLaunchTx(
+  client,
+  { ipfs, tokenMint, wallet, configKey, initialBuyLamports = 0 }
+) {
+  // Build payload
+  const payload = {
     ipfs,
     tokenMint,
     wallet,
     initialBuyLamports,
     configKey,
-  });
+  };
+
+  // If partner variables are provided, include them (partner fees)
+  // This is what makes Bags attribute the launch to your partner config.
+  if (BAGS_PARTNER_WALLET && BAGS_PARTNER_CONFIG) {
+    payload.partner = BAGS_PARTNER_WALLET;
+    payload.partnerConfig = BAGS_PARTNER_CONFIG;
+  }
+
+  const resp = await client.post('/token-launch/create-launch-transaction', payload);
 
   const tx = resp.data?.response?.transaction || resp.data?.response;
   if (!tx || typeof tx !== 'string') {
-    throw new Error(`Unexpected create-launch-transaction response: ${JSON.stringify(resp.data).slice(0, 600)}`);
+    throw new Error(
+      `Unexpected create-launch-transaction response: ${JSON.stringify(resp.data).slice(0, 600)}`
+    );
   }
 
   return { transaction: tx, raw: resp.data };
