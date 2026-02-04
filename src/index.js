@@ -25,6 +25,10 @@ const BAGS_API_KEY = process.env.BAGS_API_KEY;
 const OPERATOR_WALLET = process.env.BAGS_WALLET_ADDRESS || process.env.OPERATOR_WALLET;
 const OPERATOR_PRIVATE_KEY = process.env.BAGS_PRIVATE_KEY || process.env.OPERATOR_PRIVATE_KEY;
 
+// Partner program (optional - for receiving platform fees)
+const BAGS_PARTNER_WALLET = process.env.BAGS_PARTNER_WALLET || null;
+const BAGS_PARTNER_CONFIG = process.env.BAGS_PARTNER_CONFIG || null;
+
 const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
 
@@ -44,6 +48,13 @@ function requireEnv(name, value) {
 requireEnv('BAGS_API_KEY', BAGS_API_KEY);
 requireEnv('OPERATOR_WALLET (BAGS_WALLET_ADDRESS)', OPERATOR_WALLET);
 requireEnv('OPERATOR_PRIVATE_KEY (BAGS_PRIVATE_KEY)', OPERATOR_PRIVATE_KEY);
+
+if (BAGS_PARTNER_WALLET && BAGS_PARTNER_CONFIG) {
+  console.log('✅ Partner program enabled');
+  console.log(`   Partner wallet: ${BAGS_PARTNER_WALLET.slice(0, 4)}...${BAGS_PARTNER_WALLET.slice(-4)}`);
+} else if (BAGS_PARTNER_WALLET || BAGS_PARTNER_CONFIG) {
+  console.warn('⚠️ Partial partner config detected. Both BAGS_PARTNER_WALLET and BAGS_PARTNER_CONFIG are required.');
+}
 
 // ---------------------------------------------------------------------------
 // DB
@@ -169,11 +180,17 @@ async function createTokenInfoMultipart({ name, symbol, description, imageUrl, w
   return resp.data.response;
 }
 
-async function createFeeShareConfigTx({ payer, baseMint, claimersArray, basisPointsArray }) {
-  // POST /fee-share/config (v2) citeturn1view2
+async function createFeeShareConfigTx({ payer, baseMint, claimersArray, basisPointsArray, partner, partnerConfig }) {
+  // POST /fee-share/config (v2)
+  const payload = { payer, baseMint, claimersArray, basisPointsArray };
+  
+  // Add partner fields if provided
+  if (partner) payload.partner = partner;
+  if (partnerConfig) payload.partnerConfig = partnerConfig;
+  
   const resp = await axios.post(
     `${BAGS_API_BASE}/fee-share/config`,
-    { payer, baseMint, claimersArray, basisPointsArray },
+    payload,
     { headers: { 'x-api-key': BAGS_API_KEY, 'Content-Type': 'application/json' }, timeout: 30_000 }
   );
 
@@ -510,6 +527,8 @@ app.post('/api/startups/:id/launch', async (req, res) => {
       baseMint: tokenMint,
       claimersArray,
       basisPointsArray,
+      partner: BAGS_PARTNER_WALLET,
+      partnerConfig: BAGS_PARTNER_CONFIG,
     });
 
     const configKey = feeShare.meteoraConfigKey || feeShare.configKey;
