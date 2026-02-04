@@ -3,19 +3,22 @@ const FormData = require('form-data');
 
 const BAGS_API_BASE = 'https://public-api-v2.bags.fm/api/v1';
 
-// Optional partner fee settings (safe defaults: disabled if not provided)
+// Partner (Golden Era)
 const BAGS_PARTNER_WALLET = (process.env.BAGS_PARTNER_WALLET || '').trim();
 const BAGS_PARTNER_CONFIG = (process.env.BAGS_PARTNER_CONFIG || '').trim();
 
+function mask(s) {
+  if (!s) return '';
+  if (s.length <= 10) return s;
+  return `${s.slice(0, 6)}...${s.slice(-4)}`;
+}
+
 function bagsClient(apiKey) {
-  const client = axios.create({
+  return axios.create({
     baseURL: BAGS_API_BASE,
     timeout: 45_000,
-    headers: {
-      'x-api-key': apiKey,
-    },
+    headers: { 'x-api-key': apiKey },
   });
-  return client;
 }
 
 async function getFeeShareWallet(client, { provider, username }) {
@@ -41,9 +44,7 @@ async function createTokenInfo(
   }
 ) {
   const fd = new FormData();
-  if (imageFileBuffer) {
-    fd.append('image', imageFileBuffer, imageFileName || 'logo.png');
-  }
+  if (imageFileBuffer) fd.append('image', imageFileBuffer, imageFileName || 'logo.png');
   if (name) fd.append('name', name);
   if (symbol) fd.append('symbol', symbol);
   if (description) fd.append('description', description);
@@ -60,10 +61,9 @@ async function createTokenInfo(
 
   const tokenMint = resp.data?.response?.tokenMint;
   const tokenMetadata = resp.data?.response?.tokenMetadata;
+
   if (!tokenMint || !tokenMetadata) {
-    throw new Error(
-      `Unexpected create-token-info response: ${JSON.stringify(resp.data).slice(0, 600)}`
-    );
+    throw new Error(`Unexpected create-token-info response: ${JSON.stringify(resp.data).slice(0, 600)}`);
   }
 
   return { tokenMint, tokenMetadata, raw: resp.data };
@@ -73,31 +73,42 @@ async function createFeeShareConfig(client, { payer, baseMint, claimers }) {
   const claimersArray = claimers.map((c) => c.wallet);
   const basisPointsArray = claimers.map((c) => c.bps);
 
-  const resp = await client.post('/fee-share/config', {
+  // ✅ Partner config MUST be attached here
+  const payload = {
     payer,
     baseMint,
     claimersArray,
     basisPointsArray,
-  });
+  };
+
+  if (BAGS_PARTNER_WALLET && BAGS_PARTNER_CONFIG) {
+    payload.partner = BAGS_PARTNER_WALLET;
+    payload.partnerConfig = BAGS_PARTNER_CONFIG;
+  }
+
+  // ✅ Debug (so you SEE in Railway logs that partner is actually sent)
+  console.log(
+    '[fee-share/config] partner:',
+    payload.partner ? mask(payload.partner) : 'missing',
+    'partnerConfig:',
+    payload.partnerConfig ? mask(payload.partnerConfig) : 'missing'
+  );
+
+  const resp = await client.post('/fee-share/config', payload);
 
   const r = resp.data?.response || resp.data;
   const configKey = r?.configKey || r?.meteoraConfigKey;
   const transactions = r?.transactions || [];
 
   if (!configKey) {
-    throw new Error(
-      `No configKey in fee-share response: ${JSON.stringify(resp.data).slice(0, 600)}`
-    );
+    throw new Error(`No configKey in fee-share response: ${JSON.stringify(resp.data).slice(0, 600)}`);
   }
 
   return { configKey, transactions, raw: resp.data };
 }
 
-async function createLaunchTx(
-  client,
-  { ipfs, tokenMint, wallet, configKey, initialBuyLamports = 0 }
-) {
-  // Build payload
+async function createLaunchTx(client, { ipfs, tokenMint, wallet, configKey, initialBuyLamports = 0 }) {
+  // ✅ No partner fields here. This endpoint expects the fee-share configKey (from /fee-share/config).
   const payload = {
     ipfs,
     tokenMint,
@@ -106,20 +117,11 @@ async function createLaunchTx(
     configKey,
   };
 
-  // If partner variables are provided, include them (partner fees)
-  // This is what makes Bags attribute the launch to your partner config.
-  if (BAGS_PARTNER_WALLET && BAGS_PARTNER_CONFIG) {
-    payload.partner = BAGS_PARTNER_WALLET;
-    payload.partnerConfig = BAGS_PARTNER_CONFIG;
-  }
-
   const resp = await client.post('/token-launch/create-launch-transaction', payload);
 
   const tx = resp.data?.response?.transaction || resp.data?.response;
   if (!tx || typeof tx !== 'string') {
-    throw new Error(
-      `Unexpected create-launch-transaction response: ${JSON.stringify(resp.data).slice(0, 600)}`
-    );
+    throw new Error(`Unexpected create-launch-transaction response: ${JSON.stringify(resp.data).slice(0, 600)}`);
   }
 
   return { transaction: tx, raw: resp.data };
