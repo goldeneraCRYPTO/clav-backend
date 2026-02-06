@@ -248,6 +248,34 @@ function normalizeSymbol(symbol) {
 // ---------------------------------------------------------------------------
 // ROUTES - STARTUPS
 // ---------------------------------------------------------------------------
+app.get('/api/metrics/:mint', async (req, res) => {
+  const { mint } = req.params;
+  if (!mint) return res.status(400).json({ error: 'Missing mint' });
+
+  try {
+    const resp = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
+      timeout: 15_000,
+      headers: { 'User-Agent': 'ClawValley/1.0' },
+    });
+    const pair = resp.data?.pairs?.[0];
+    if (!pair) return res.json({ success: true, data: null });
+
+    res.json({
+      success: true,
+      data: {
+        price: pair.priceUsd ? Number(pair.priceUsd) : null,
+        change24h: pair.priceChange?.h24 ?? null,
+        mcap: pair.fdv || pair.marketCap || null,
+        volume: pair.volume?.h24 || null,
+        url: pair.url || null,
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/metrics/:mint failed:', err?.response?.data || err.message || err);
+    res.status(502).json({ error: 'Failed to fetch metrics' });
+  }
+});
+
 app.get('/api/startups', async (req, res) => {
   try {
     const result = await pool.query(`
