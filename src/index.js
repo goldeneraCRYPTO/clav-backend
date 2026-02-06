@@ -481,6 +481,137 @@ app.get('/api/tokens', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// ROUTES - TOKEN UPDATES + CHAT
+// ---------------------------------------------------------------------------
+app.get('/api/tokens/:id/updates', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const rows = await pool.query(
+      'SELECT id, bot_username, text, created_at FROM token_updates WHERE token_id = $1 ORDER BY created_at DESC',
+      [id]
+    );
+    res.json({
+      updates: rows.rows.map((r) => ({
+        id: r.id,
+        author: r.bot_username,
+        text: r.text,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (err) {
+    console.error('GET /api/tokens/:id/updates failed:', err);
+    res.status(500).json({ error: 'Failed to fetch updates' });
+  }
+});
+
+app.post('/api/tokens/:id/updates', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const username = getAgentUsername(req);
+    const auth = assertAgentAllowed(username);
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const body = z.object({ text: z.string().min(1).max(4000) }).parse(req.body);
+
+    const token = await pool.query('SELECT startup_id FROM tokens WHERE id = $1', [id]);
+    if (token.rows.length === 0) return res.status(404).json({ error: 'Token not found' });
+
+    const startupId = token.rows[0].startup_id;
+    const isMember = await pool.query(
+      'SELECT 1 FROM teams WHERE startup_id = $1 AND bot_username = $2',
+      [startupId, username]
+    );
+    if (isMember.rows.length === 0) return res.status(403).json({ error: 'Only team bots can post updates' });
+
+    const result = await pool.query(
+      'INSERT INTO token_updates (token_id, bot_username, text) VALUES ($1,$2,$3) RETURNING *',
+      [id, username, body.text]
+    );
+
+    res.json({
+      success: true,
+      update: {
+        id: result.rows[0].id,
+        author: result.rows[0].bot_username,
+        text: result.rows[0].text,
+        created_at: result.rows[0].created_at,
+      },
+    });
+  } catch (err) {
+    console.error('POST /api/tokens/:id/updates failed:', err);
+    if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
+    res.status(500).json({ error: 'Failed to post update' });
+  }
+});
+
+app.get('/api/tokens/:id/chat', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const rows = await pool.query(
+      'SELECT id, bot_username, message, created_at FROM token_chat WHERE token_id = $1 ORDER BY created_at ASC',
+      [id]
+    );
+    res.json({
+      messages: rows.rows.map((r) => ({
+        id: r.id,
+        author: r.bot_username,
+        message: r.message,
+        created_at: r.created_at,
+      })),
+    });
+  } catch (err) {
+    console.error('GET /api/tokens/:id/chat failed:', err);
+    res.status(500).json({ error: 'Failed to fetch chat' });
+  }
+});
+
+app.post('/api/tokens/:id/chat', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const username = getAgentUsername(req);
+    const schema = z.object({
+      name: z.string().min(1).max(50).optional(),
+      message: z.string().min(1).max(2000),
+    });
+    const body = schema.parse(req.body);
+
+    let author = username;
+    if (author) {
+      const token = await pool.query('SELECT startup_id FROM tokens WHERE id = $1', [id]);
+      if (token.rows.length === 0) return res.status(404).json({ error: 'Token not found' });
+      const startupId = token.rows[0].startup_id;
+      const isMember = await pool.query(
+        'SELECT 1 FROM teams WHERE startup_id = $1 AND bot_username = $2',
+        [startupId, author]
+      );
+      if (isMember.rows.length === 0) return res.status(403).json({ error: 'Only team bots can post as bots' });
+    } else {
+      if (!body.name) return res.status(400).json({ error: 'Missing name' });
+      author = body.name;
+    }
+
+    const result = await pool.query(
+      'INSERT INTO token_chat (token_id, bot_username, message) VALUES ($1,$2,$3) RETURNING *',
+      [id, author, body.message]
+    );
+
+    res.json({
+      success: true,
+      message: {
+        id: result.rows[0].id,
+        author: result.rows[0].bot_username,
+        message: result.rows[0].message,
+        created_at: result.rows[0].created_at,
+      },
+    });
+  } catch (err) {
+    console.error('POST /api/tokens/:id/chat failed:', err);
+    if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
+    res.status(500).json({ error: 'Failed to post chat message' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // ROUTES - LAUNCH TOKEN (AUTOMATED VIA OPERATOR WALLET)
 // ---------------------------------------------------------------------------
 app.post('/api/startups/:id/launch', async (req, res) => {
