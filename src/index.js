@@ -229,15 +229,33 @@ const FeeShareSchema = z.object({
   percentage: z.number().int().min(1).max(100),
 });
 
+const optionalNonEmpty = z.preprocess(
+  (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+  z.string().min(1).optional()
+);
+
+const optionalUrl = z.preprocess(
+  (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+  z.string().url().optional()
+);
+
 const LaunchSchema = z.object({
   tokenName: z.string().min(1).max(32),
   symbol: z.string().min(1).max(10),
   description: z.string().min(1).max(500),
   imageUrl: z.string().url(),
-  website: z.string().url().optional().or(z.literal('')).optional(),
-  twitter: z.string().optional().or(z.literal('')).optional(),
-  telegram: z.string().optional().or(z.literal('')).optional(),
+  website: optionalUrl,
+  twitter: optionalNonEmpty,
+  telegram: optionalNonEmpty,
   feeShares: z.array(FeeShareSchema).optional(),
+}).superRefine((data, ctx) => {
+  if (!data.website && !data.twitter && !data.telegram) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['website'],
+      message: 'Provide at least one link: website, twitter, or telegram',
+    });
+  }
 });
 
 function normalizeSymbol(symbol) {
@@ -347,13 +365,21 @@ app.post('/api/startups/create', async (req, res) => {
       description: z.string().min(1),
       plan: z.string().optional(),
       category: z.string().min(1),
-      image: z.string().optional(),
+      image: z.string().min(1),
       mvpLink: z.string().optional(),
-      website: z.string().optional(),
-      github: z.string().optional(),
-      twitter: z.string().optional(),
+      website: optionalUrl,
+      github: optionalUrl,
+      twitter: optionalNonEmpty,
       roadmap: z.string().optional(),
-      fundingGoal: z.string().optional(),
+      fundingGoal: z.string().min(1),
+    }).superRefine((data, ctx) => {
+      if (!data.website && !data.github && !data.twitter) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['website'],
+          message: 'Provide at least one link: website, github, or twitter',
+        });
+      }
     });
 
     const body = schema.parse(req.body);
