@@ -258,6 +258,27 @@ const LaunchSchema = z.object({
   }
 });
 
+const UpdateStartupSchema = z.object({
+  title: z.string().min(1).max(255).optional(),
+  shortDesc: z.string().min(1).max(120).optional(),
+  description: z.string().min(1).optional(),
+  plan: optionalNonEmpty,
+  category: z.string().min(1).optional(),
+  image: z.string().min(1).optional(),
+  mvpLink: optionalUrl,
+  website: optionalUrl,
+  github: optionalUrl,
+  twitter: optionalNonEmpty,
+  fundingGoal: z.string().min(1).optional(),
+}).superRefine((data, ctx) => {
+  if (Object.keys(data).length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Provide at least one field to update',
+    });
+  }
+});
+
 function normalizeSymbol(symbol) {
   // Frontend may pass "$TICK"; Bags expects plain symbol.
   return symbol.startsWith('$') ? symbol.slice(1) : symbol;
@@ -420,6 +441,66 @@ app.post('/api/startups/create', async (req, res) => {
     console.error('POST /api/startups/create failed:', err);
     if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
     res.status(500).json({ error: 'Failed to create startup' });
+  }
+});
+
+app.patch('/api/startups/:id', async (req, res) => {
+  try {
+    const username = getAgentUsername(req);
+    const auth = assertAgentAllowed(username);
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+
+    const { id } = req.params;
+    const body = UpdateStartupSchema.parse(req.body);
+
+    const startup = await pool.query('SELECT * FROM startups WHERE id = $1', [id]);
+    if (startup.rows.length === 0) return res.status(404).json({ error: 'Startup not found' });
+
+    const isMember = await pool.query('SELECT 1 FROM teams WHERE startup_id = $1 AND bot_username = $2', [id, username]);
+    if (isMember.rows.length === 0) return res.status(403).json({ error: 'Only team members can edit startup' });
+
+    const current = startup.rows[0];
+    const nextWebsite = body.website !== undefined ? body.website : current.website;
+    const nextGithub = body.github !== undefined ? body.github : current.github;
+    const nextTwitter = body.twitter !== undefined ? body.twitter : current.twitter;
+    if (!nextWebsite && !nextGithub && !nextTwitter) {
+      return res.status(400).json({ error: 'Startup must have at least one link: website, github, or twitter' });
+    }
+
+    const updates = [];
+    const values = [];
+    const set = (column, value) => {
+      values.push(value);
+      updates.push(`${column} = $${values.length}`);
+    };
+
+    if (body.title !== undefined) set('title', body.title);
+    if (body.shortDesc !== undefined) set('short_desc', body.shortDesc);
+    if (body.description !== undefined) set('description', body.description);
+    if (body.plan !== undefined) set('plan', body.plan);
+    if (body.category !== undefined) set('category', body.category);
+    if (body.image !== undefined) set('image', body.image);
+    if (body.mvpLink !== undefined) set('mvp_link', body.mvpLink);
+    if (body.website !== undefined) set('website', body.website);
+    if (body.github !== undefined) set('github', body.github);
+    if (body.twitter !== undefined) set('twitter', body.twitter);
+    if (body.fundingGoal !== undefined) set('funding_goal', body.fundingGoal);
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    values.push(id);
+    const result = await pool.query(
+      `UPDATE startups SET ${updates.join(', ')} WHERE id = $${values.length} RETURNING *`,
+      values
+    );
+
+    res.json({ success: true, startup: result.rows[0] });
+  } catch (err) {
+    console.error('PATCH /api/startups/:id failed:', err);
+    if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
+    res.status(500).json({ error: 'Failed to update startup' });
   }
 });
 
