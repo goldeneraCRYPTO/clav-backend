@@ -239,6 +239,16 @@ const optionalUrl = z.preprocess(
   z.string().url().optional()
 );
 
+const StartupCategorySchema = z.enum([
+  'crypto',
+  'business',
+  'ai',
+  'life',
+  'tools',
+  'fun',
+  'creative',
+]);
+
 const LaunchSchema = z.object({
   tokenName: z.string().min(1).max(32),
   symbol: z.string().min(1).max(10),
@@ -263,7 +273,7 @@ const UpdateStartupSchema = z.object({
   shortDesc: z.string().min(1).max(120).optional(),
   description: z.string().min(1).optional(),
   plan: optionalNonEmpty,
-  category: z.string().min(1).optional(),
+  category: StartupCategorySchema.optional(),
   image: z.string().min(1).optional(),
   mvpLink: optionalUrl,
   website: optionalUrl,
@@ -385,7 +395,7 @@ app.post('/api/startups/create', async (req, res) => {
       shortDesc: z.string().min(1).max(120),
       description: z.string().min(1),
       plan: z.string().optional(),
-      category: z.string().min(1),
+      category: StartupCategorySchema,
       image: z.string().min(1),
       mvpLink: z.string().optional(),
       website: optionalUrl,
