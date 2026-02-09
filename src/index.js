@@ -5,6 +5,7 @@ const cors = require('cors');
 const axios = require('axios');
 const FormData = require('form-data');
 const bs58 = require('bs58');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 const { z } = require('zod');
 const {
@@ -38,6 +39,10 @@ const ALLOWLIST = (process.env.AGENT_ALLOWLIST || '')
   .filter(Boolean);
 
 const REQUIRE_ALLOWLIST = String(process.env.REQUIRE_ALLOWLIST || '').toLowerCase() === 'true';
+const AUTH_ALLOW_LEGACY_HEADER = String(process.env.AUTH_ALLOW_LEGACY_HEADER || 'true').toLowerCase() === 'true';
+const JWT_SECRET = process.env.JWT_SECRET || null;
+const APP_JWT_TTL_SECONDS = parseInt(process.env.APP_JWT_TTL_SECONDS || '3600', 10); // default 1h
+const AUTH_CHALLENGE_TTL_MS = parseInt(process.env.AUTH_CHALLENGE_TTL_MS || String(15 * 60 * 1000), 10); // default 15m
 
 function requireEnv(name, value) {
   if (!value) {
@@ -48,6 +53,9 @@ function requireEnv(name, value) {
 requireEnv('BAGS_API_KEY', BAGS_API_KEY);
 requireEnv('OPERATOR_WALLET (BAGS_WALLET_ADDRESS)', OPERATOR_WALLET);
 requireEnv('OPERATOR_PRIVATE_KEY (BAGS_PRIVATE_KEY)', OPERATOR_PRIVATE_KEY);
+if (!JWT_SECRET) {
+  console.warn('⚠️ Missing JWT_SECRET. Agent auth endpoints will fail until it is set.');
+}
 
 if (BAGS_PARTNER_WALLET && BAGS_PARTNER_CONFIG) {
   console.log('✅ Partner program enabled');
@@ -86,12 +94,92 @@ app.get('/health', (req, res) => {
 // ---------------------------------------------------------------------------
 // AUTH HELPERS
 // ---------------------------------------------------------------------------
+const authSessions = new Map();
+
+function base64url(input) {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function signAppJwt(payload) {
+  if (!JWT_SECRET) throw new Error('JWT secret is not configured');
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const body = {
+    ...payload,
+    iat: now,
+    exp: now + APP_JWT_TTL_SECONDS,
+    jti: crypto.randomUUID(),
+  };
+  const encodedHeader = base64url(JSON.stringify(header));
+  const encodedBody = base64url(JSON.stringify(body));
+  const sig = crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(`${encodedHeader}.${encodedBody}`)
+    .digest('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+  return `${encodedHeader}.${encodedBody}.${sig}`;
+}
+
+function verifyAppJwt(token) {
+  if (!JWT_SECRET) throw new Error('JWT secret is not configured');
+  if (!token || typeof token !== 'string') throw new Error('Missing token');
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Invalid token format');
+
+  const [encodedHeader, encodedBody, providedSig] = parts;
+  const expectedSig = crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(`${encodedHeader}.${encodedBody}`)
+    .digest('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+
+  if (!crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expectedSig))) {
+    throw new Error('Invalid token signature');
+  }
+
+  const payload = JSON.parse(Buffer.from(encodedBody, 'base64url').toString('utf8'));
+  const now = Math.floor(Date.now() / 1000);
+  if (!payload?.exp || payload.exp <= now) throw new Error('Token expired');
+  return payload;
+}
+
+function readBearer(req) {
+  const value = req.headers.authorization;
+  if (!value || typeof value !== 'string') return null;
+  const m = value.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
+
 function getAgentUsername(req) {
-  return req.headers['x-moltbook-username'] || req.headers['x-agent-username'] || null;
+  const bearer = readBearer(req);
+  if (bearer) {
+    try {
+      const payload = verifyAppJwt(bearer);
+      req.agent = { username: payload.username, auth: 'jwt' };
+      return payload.username || null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  if (AUTH_ALLOW_LEGACY_HEADER) {
+    const legacy = req.headers['x-moltbook-username'] || req.headers['x-agent-username'] || null;
+    if (legacy) req.agent = { username: legacy, auth: 'legacy-header' };
+    return legacy;
+  }
+  return null;
 }
 
 function assertAgentAllowed(username) {
-  if (!username) return { ok: false, status: 401, error: 'Missing x-moltbook-username header' };
+  if (!username) return { ok: false, status: 401, error: 'Missing or invalid agent authentication' };
 
   if (REQUIRE_ALLOWLIST) {
     if (ALLOWLIST.length === 0) {
@@ -103,6 +191,124 @@ function assertAgentAllowed(username) {
   }
   return { ok: true };
 }
+
+function cleanupExpiredAuthSessions() {
+  const now = Date.now();
+  for (const [id, session] of authSessions.entries()) {
+    if (session.expiresAt <= now || session.used) authSessions.delete(id);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ROUTES - AUTH (Moltbook via Bags challenge flow)
+// ---------------------------------------------------------------------------
+app.post('/api/auth/init', async (req, res) => {
+  try {
+    cleanupExpiredAuthSessions();
+    if (!BAGS_API_KEY) return res.status(500).json({ error: 'Server missing BAGS_API_KEY' });
+    const body = z.object({ username: z.string().min(1).max(100) }).parse(req.body);
+    const username = body.username.trim();
+
+    const bagsResp = await axios.post(
+      `${BAGS_API_BASE}/agent/auth/init`,
+      { provider: 'moltbook', agentUsername: username },
+      { headers: { 'x-api-key': BAGS_API_KEY, 'Content-Type': 'application/json' }, timeout: 20_000 }
+    );
+
+    if (!bagsResp.data?.success) {
+      return res.status(400).json({ error: bagsResp.data?.error || 'Failed to initialize auth challenge' });
+    }
+
+    const response = bagsResp.data.response || {};
+    const publicIdentifier = response.publicIdentifier;
+    const secret = response.secret;
+    const challenge = response.challenge;
+    if (!publicIdentifier || !secret || !challenge) {
+      return res.status(502).json({ error: 'Unexpected auth init response from provider' });
+    }
+
+    const expiresAt = Date.now() + AUTH_CHALLENGE_TTL_MS;
+    authSessions.set(publicIdentifier, {
+      username,
+      secret,
+      challenge,
+      expiresAt,
+      used: false,
+    });
+
+    res.json({
+      success: true,
+      auth: {
+        challengeId: publicIdentifier,
+        challengeText: challenge,
+        expiresAt: new Date(expiresAt).toISOString(),
+        provider: 'moltbook',
+        instruction: 'Post this exact challenge text from your Moltbook account, then call /api/auth/verify with challengeId and postId.',
+      },
+    });
+  } catch (err) {
+    console.error('POST /api/auth/init failed:', err?.response?.data || err);
+    if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
+    res.status(500).json({ error: 'Failed to init auth challenge' });
+  }
+});
+
+app.post('/api/auth/verify', async (req, res) => {
+  try {
+    cleanupExpiredAuthSessions();
+    if (!BAGS_API_KEY) return res.status(500).json({ error: 'Server missing BAGS_API_KEY' });
+    if (!JWT_SECRET) return res.status(500).json({ error: 'Server missing JWT_SECRET' });
+
+    const body = z.object({
+      challengeId: z.string().min(1),
+      postId: z.string().min(1),
+    }).parse(req.body);
+
+    const session = authSessions.get(body.challengeId);
+    if (!session) return res.status(400).json({ error: 'Challenge not found or expired' });
+    if (session.used) return res.status(400).json({ error: 'Challenge already used' });
+    if (session.expiresAt <= Date.now()) {
+      authSessions.delete(body.challengeId);
+      return res.status(400).json({ error: 'Challenge expired' });
+    }
+
+    const bagsResp = await axios.post(
+      `${BAGS_API_BASE}/agent/auth/login`,
+      {
+        provider: 'moltbook',
+        publicIdentifier: body.challengeId,
+        secret: session.secret,
+        postId: body.postId,
+      },
+      { headers: { 'x-api-key': BAGS_API_KEY, 'Content-Type': 'application/json' }, timeout: 20_000 }
+    );
+
+    if (!bagsResp.data?.success) {
+      return res.status(401).json({ error: bagsResp.data?.error || 'Challenge verification failed' });
+    }
+
+    session.used = true;
+    authSessions.delete(body.challengeId);
+
+    const appToken = signAppJwt({
+      username: session.username,
+      provider: 'moltbook',
+      verifiedWith: 'bags-agent-auth',
+    });
+
+    res.json({
+      success: true,
+      token: appToken,
+      tokenType: 'Bearer',
+      expiresIn: APP_JWT_TTL_SECONDS,
+      username: session.username,
+    });
+  } catch (err) {
+    console.error('POST /api/auth/verify failed:', err?.response?.data || err);
+    if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
+    res.status(500).json({ error: 'Failed to verify challenge' });
+  }
+});
 
 // ---------------------------------------------------------------------------
 // SOLANA + SIGNING
