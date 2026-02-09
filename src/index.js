@@ -205,14 +205,15 @@ function cleanupExpiredAuthSessions() {
 app.post('/api/auth/init', async (req, res) => {
   try {
     cleanupExpiredAuthSessions();
-    if (!BAGS_API_KEY) return res.status(500).json({ error: 'Server missing BAGS_API_KEY' });
     const body = z.object({ username: z.string().min(1).max(100) }).parse(req.body);
     const username = body.username.trim();
 
+    const bagsHeaders = { 'Content-Type': 'application/json' };
+    if (BAGS_API_KEY) bagsHeaders['x-api-key'] = BAGS_API_KEY;
     const bagsResp = await axios.post(
       `${BAGS_API_BASE}/agent/auth/init`,
-      { provider: 'moltbook', agentUsername: username },
-      { headers: { 'x-api-key': BAGS_API_KEY, 'Content-Type': 'application/json' }, timeout: 20_000 }
+      { agentUsername: username },
+      { headers: bagsHeaders, timeout: 20_000 }
     );
 
     if (!bagsResp.data?.success) {
@@ -222,7 +223,7 @@ app.post('/api/auth/init', async (req, res) => {
     const response = bagsResp.data.response || {};
     const publicIdentifier = response.publicIdentifier;
     const secret = response.secret;
-    const challenge = response.challenge;
+    const challenge = response.verificationPostContent || response.challenge;
     if (!publicIdentifier || !secret || !challenge) {
       return res.status(502).json({ error: 'Unexpected auth init response from provider' });
     }
@@ -249,14 +250,16 @@ app.post('/api/auth/init', async (req, res) => {
   } catch (err) {
     console.error('POST /api/auth/init failed:', err?.response?.data || err);
     if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
-    res.status(500).json({ error: 'Failed to init auth challenge' });
+    res.status(500).json({
+      error: 'Failed to init auth challenge',
+      upstream: err?.response?.data || err?.message || null,
+    });
   }
 });
 
 app.post('/api/auth/verify', async (req, res) => {
   try {
     cleanupExpiredAuthSessions();
-    if (!BAGS_API_KEY) return res.status(500).json({ error: 'Server missing BAGS_API_KEY' });
     if (!JWT_SECRET) return res.status(500).json({ error: 'Server missing JWT_SECRET' });
 
     const body = z.object({
@@ -272,15 +275,16 @@ app.post('/api/auth/verify', async (req, res) => {
       return res.status(400).json({ error: 'Challenge expired' });
     }
 
+    const bagsHeaders = { 'Content-Type': 'application/json' };
+    if (BAGS_API_KEY) bagsHeaders['x-api-key'] = BAGS_API_KEY;
     const bagsResp = await axios.post(
       `${BAGS_API_BASE}/agent/auth/login`,
       {
-        provider: 'moltbook',
         publicIdentifier: body.challengeId,
         secret: session.secret,
         postId: body.postId,
       },
-      { headers: { 'x-api-key': BAGS_API_KEY, 'Content-Type': 'application/json' }, timeout: 20_000 }
+      { headers: bagsHeaders, timeout: 20_000 }
     );
 
     if (!bagsResp.data?.success) {
@@ -306,7 +310,10 @@ app.post('/api/auth/verify', async (req, res) => {
   } catch (err) {
     console.error('POST /api/auth/verify failed:', err?.response?.data || err);
     if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
-    res.status(500).json({ error: 'Failed to verify challenge' });
+    res.status(500).json({
+      error: 'Failed to verify challenge',
+      upstream: err?.response?.data || err?.message || null,
+    });
   }
 });
 
