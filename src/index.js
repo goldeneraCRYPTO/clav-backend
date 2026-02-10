@@ -219,6 +219,158 @@ function normalizeText(v) {
   return String(v || '').replace(/\s+/g, ' ').trim();
 }
 
+const STARTUP_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+const STARTUP_IMAGE_MIN_WIDTH = 800;
+const STARTUP_IMAGE_MIN_HEIGHT = 420;
+const STARTUP_IMAGE_MIN_RATIO = 1.82; // ~1.9:1 with tolerance
+const STARTUP_IMAGE_MAX_RATIO = 1.98; // ~1.9:1 with tolerance
+
+class StartupImageValidationError extends Error {
+  constructor(code, details, status = 400) {
+    super(details);
+    this.name = 'StartupImageValidationError';
+    this.code = code;
+    this.details = details;
+    this.status = status;
+  }
+}
+
+function readPngDimensions(buffer) {
+  if (buffer.length < 24) return null;
+  const signature = '89504e470d0a1a0a';
+  if (buffer.subarray(0, 8).toString('hex') !== signature) return null;
+  return {
+    width: buffer.readUInt32BE(16),
+    height: buffer.readUInt32BE(20),
+  };
+}
+
+function readJpegDimensions(buffer) {
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return null;
+  let offset = 2;
+  while (offset + 3 < buffer.length) {
+    if (buffer[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = buffer[offset + 1];
+    offset += 2;
+
+    if (marker === 0xd8 || marker === 0xd9) continue; // SOI / EOI
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue; // TEM / RST
+
+    if (offset + 1 >= buffer.length) break;
+    const segmentLength = buffer.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > buffer.length) break;
+
+    const isSof =
+      marker === 0xc0 || marker === 0xc1 || marker === 0xc2 || marker === 0xc3 ||
+      marker === 0xc5 || marker === 0xc6 || marker === 0xc7 ||
+      marker === 0xc9 || marker === 0xca || marker === 0xcb ||
+      marker === 0xcd || marker === 0xce || marker === 0xcf;
+
+    if (isSof) {
+      if (segmentLength < 7) break;
+      return {
+        height: buffer.readUInt16BE(offset + 3),
+        width: buffer.readUInt16BE(offset + 5),
+      };
+    }
+
+    offset += segmentLength;
+  }
+  return null;
+}
+
+async function validateStartupImageUrl(imageUrl) {
+  if (!/^https?:\/\//i.test(imageUrl)) {
+    throw new StartupImageValidationError(
+      'INVALID_IMAGE_URL',
+      'Image must be an absolute http/https URL'
+    );
+  }
+
+  let resp;
+  try {
+    resp = await axios.get(imageUrl, {
+      responseType: 'arraybuffer',
+      timeout: 20_000,
+      maxContentLength: STARTUP_IMAGE_MAX_BYTES + 1,
+      maxBodyLength: STARTUP_IMAGE_MAX_BYTES + 1,
+      headers: {
+        'User-Agent': 'AgentValley/1.0',
+        Accept: 'image/png,image/jpeg,image/*;q=0.8,*/*;q=0.1',
+      },
+      validateStatus: (status) => status >= 200 && status < 400,
+    });
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('maxContentLength')) {
+      throw new StartupImageValidationError(
+        'IMAGE_TOO_LARGE',
+        'Image exceeds 2MB. Use JPG/PNG up to 2MB.'
+      );
+    }
+    throw new StartupImageValidationError(
+      'IMAGE_FETCH_FAILED',
+      'Failed to download image URL. Ensure the URL is public and accessible.'
+    );
+  }
+
+  const buffer = Buffer.isBuffer(resp.data) ? resp.data : Buffer.from(resp.data || []);
+  if (!buffer.length) {
+    throw new StartupImageValidationError('EMPTY_IMAGE', 'Downloaded image is empty');
+  }
+  if (buffer.length > STARTUP_IMAGE_MAX_BYTES) {
+    throw new StartupImageValidationError(
+      'IMAGE_TOO_LARGE',
+      'Image exceeds 2MB. Use JPG/PNG up to 2MB.'
+    );
+  }
+
+  const contentType = String(resp.headers?.['content-type'] || '').toLowerCase();
+  const png = readPngDimensions(buffer);
+  const jpeg = readJpegDimensions(buffer);
+  const isPng = !!png || contentType.includes('image/png');
+  const isJpeg = !!jpeg || contentType.includes('image/jpeg') || contentType.includes('image/jpg');
+  if (!isPng && !isJpeg) {
+    throw new StartupImageValidationError(
+      'INVALID_IMAGE_FORMAT',
+      'Image must be JPG or PNG.'
+    );
+  }
+
+  const dims = png || jpeg;
+  if (!dims?.width || !dims?.height) {
+    throw new StartupImageValidationError(
+      'INVALID_IMAGE_METADATA',
+      'Could not read image dimensions. Use standard JPG/PNG.'
+    );
+  }
+
+  if (dims.width < STARTUP_IMAGE_MIN_WIDTH || dims.height < STARTUP_IMAGE_MIN_HEIGHT) {
+    throw new StartupImageValidationError(
+      'IMAGE_TOO_SMALL',
+      `Image is too small (${dims.width}x${dims.height}). Minimum is ${STARTUP_IMAGE_MIN_WIDTH}x${STARTUP_IMAGE_MIN_HEIGHT}.`
+    );
+  }
+
+  const ratio = dims.width / dims.height;
+  if (ratio < STARTUP_IMAGE_MIN_RATIO || ratio > STARTUP_IMAGE_MAX_RATIO) {
+    throw new StartupImageValidationError(
+      'INVALID_IMAGE_RATIO',
+      `Image ratio must be close to 1.9:1 (recommended 1200x630). Got ${dims.width}x${dims.height}.`
+    );
+  }
+
+  return {
+    width: dims.width,
+    height: dims.height,
+    sizeBytes: buffer.length,
+    format: isPng ? 'png' : 'jpeg',
+  };
+}
+
 function extractCommentsArray(payload) {
   if (Array.isArray(payload?.comments)) return payload.comments;
   if (Array.isArray(payload?.data?.comments)) return payload.data.comments;
@@ -712,6 +864,7 @@ app.post('/api/startups/create', async (req, res) => {
     });
 
     const body = schema.parse(req.body);
+    await validateStartupImageUrl(body.image);
 
     const result = await pool.query(
       `
@@ -747,6 +900,13 @@ app.post('/api/startups/create', async (req, res) => {
     res.json({ success: true, startup: result.rows[0] });
   } catch (err) {
     console.error('POST /api/startups/create failed:', err);
+    if (err instanceof StartupImageValidationError) {
+      return res.status(err.status).json({
+        error: 'Invalid startup image',
+        code: err.code,
+        details: err.details,
+      });
+    }
     if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
     res.status(500).json({ error: 'Failed to create startup' });
   }
@@ -773,6 +933,9 @@ app.patch('/api/startups/:id', async (req, res) => {
     const nextTwitter = body.twitter !== undefined ? body.twitter : current.twitter;
     if (!nextWebsite && !nextGithub && !nextTwitter) {
       return res.status(400).json({ error: 'Startup must have at least one link: website, github, or twitter' });
+    }
+    if (body.image !== undefined) {
+      await validateStartupImageUrl(body.image);
     }
 
     const updates = [];
@@ -807,6 +970,13 @@ app.patch('/api/startups/:id', async (req, res) => {
     res.json({ success: true, startup: result.rows[0] });
   } catch (err) {
     console.error('PATCH /api/startups/:id failed:', err);
+    if (err instanceof StartupImageValidationError) {
+      return res.status(err.status).json({
+        error: 'Invalid startup image',
+        code: err.code,
+        details: err.details,
+      });
+    }
     if (err?.name === 'ZodError') return res.status(400).json({ error: err.issues });
     res.status(500).json({ error: 'Failed to update startup' });
   }
