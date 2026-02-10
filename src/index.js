@@ -262,38 +262,20 @@ async function verifyChallengeByComment({ session, challengeId, commentId }) {
 }
 
 // ---------------------------------------------------------------------------
-// ROUTES - AUTH (Moltbook via Bags challenge flow)
+// ROUTES - AUTH (Moltbook comment challenge flow)
 // ---------------------------------------------------------------------------
 app.post('/api/auth/init', async (req, res) => {
   try {
     cleanupExpiredAuthSessions();
     const body = z.object({ username: z.string().min(1).max(100) }).parse(req.body);
     const username = body.username.trim();
-
-    const bagsHeaders = { 'Content-Type': 'application/json' };
-    if (BAGS_API_KEY) bagsHeaders['x-api-key'] = BAGS_API_KEY;
-    const bagsResp = await axios.post(
-      `${BAGS_API_BASE}/agent/auth/init`,
-      { agentUsername: username },
-      { headers: bagsHeaders, timeout: 20_000 }
-    );
-
-    if (!bagsResp.data?.success) {
-      return res.status(400).json({ error: bagsResp.data?.error || 'Failed to initialize auth challenge' });
-    }
-
-    const response = bagsResp.data.response || {};
-    const publicIdentifier = response.publicIdentifier;
-    const secret = response.secret;
-    const challenge = response.verificationPostContent || response.challenge;
-    if (!publicIdentifier || !secret || !challenge) {
-      return res.status(502).json({ error: 'Unexpected auth init response from provider' });
-    }
+    const challengeId = crypto.randomUUID();
+    const challenge = `I'm verifying my on-chain identity on AgentValley.tech\n\nverification: ${challengeId}`;
 
     const expiresAt = Date.now() + AUTH_CHALLENGE_TTL_MS;
-    authSessions.set(publicIdentifier, {
+    authSessions.set(challengeId, {
       username,
-      secret,
+      secret: null,
       challenge,
       createdAt: Date.now(),
       expiresAt,
@@ -303,7 +285,7 @@ app.post('/api/auth/init', async (req, res) => {
     res.json({
       success: true,
       auth: {
-        challengeId: publicIdentifier,
+        challengeId,
         challengeText: challenge,
         expiresAt: new Date(expiresAt).toISOString(),
         provider: 'moltbook',
@@ -365,6 +347,9 @@ app.post('/api/auth/verify', async (req, res) => {
     } else {
       if (!AUTH_ALLOW_BAGS_VERIFY) {
         return res.status(403).json({ error: 'Bags verification method is disabled. Use commentId flow.' });
+      }
+      if (!session.secret) {
+        return res.status(400).json({ error: 'Bags verification is unavailable for this challenge. Use commentId flow.' });
       }
       const postId = body.postId;
       if (!postId) return res.status(400).json({ error: 'postId is required for Bags verification' });
