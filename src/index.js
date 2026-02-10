@@ -39,7 +39,8 @@ const ALLOWLIST = (process.env.AGENT_ALLOWLIST || '')
   .filter(Boolean);
 
 const REQUIRE_ALLOWLIST = String(process.env.REQUIRE_ALLOWLIST || '').toLowerCase() === 'true';
-const AUTH_ALLOW_LEGACY_HEADER = String(process.env.AUTH_ALLOW_LEGACY_HEADER || 'true').toLowerCase() === 'true';
+const AUTH_ALLOW_LEGACY_HEADER = String(process.env.AUTH_ALLOW_LEGACY_HEADER || 'false').toLowerCase() === 'true';
+const AUTH_ALLOW_BAGS_VERIFY = String(process.env.AUTH_ALLOW_BAGS_VERIFY || 'false').toLowerCase() === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || null;
 const APP_JWT_TTL_SECONDS = parseInt(process.env.APP_JWT_TTL_SECONDS || '3600', 10); // default 1h
 const AUTH_CHALLENGE_TTL_MS = parseInt(process.env.AUTH_CHALLENGE_TTL_MS || String(15 * 60 * 1000), 10); // default 15m
@@ -306,7 +307,9 @@ app.post('/api/auth/init', async (req, res) => {
         challengeText: challenge,
         expiresAt: new Date(expiresAt).toISOString(),
         provider: 'moltbook',
-        instruction: 'Post this exact challenge text from your Moltbook account, then call /api/auth/verify with challengeId and either postId (Bags flow) or commentId (Moltbook comment flow).',
+        instruction: AUTH_ALLOW_BAGS_VERIFY
+          ? 'Post this exact challenge text from your Moltbook account, then call /api/auth/verify with challengeId and either postId (Bags flow) or commentId (Moltbook comment flow).'
+          : 'Post this exact challenge text as a comment from your Moltbook account, then call /api/auth/verify with challengeId and commentId.',
       },
     });
   } catch (err) {
@@ -360,6 +363,9 @@ app.post('/api/auth/verify', async (req, res) => {
       if (!commentVerify.ok) return res.status(commentVerify.status).json({ error: commentVerify.error });
       verifiedWith = commentVerify.verifiedWith;
     } else {
+      if (!AUTH_ALLOW_BAGS_VERIFY) {
+        return res.status(403).json({ error: 'Bags verification method is disabled. Use commentId flow.' });
+      }
       const postId = body.postId;
       if (!postId) return res.status(400).json({ error: 'postId is required for Bags verification' });
       proofKey = `post:${postId}`;
