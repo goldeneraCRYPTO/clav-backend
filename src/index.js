@@ -102,6 +102,9 @@ app.get('/health', (req, res) => {
 // ---------------------------------------------------------------------------
 const authSessions = new Map();
 const usedProofIds = new Set();
+const metricsCache = new Map();
+const METRICS_TTL_MS = parseInt(process.env.METRICS_TTL_MS || '60000', 10);
+const METRICS_STALE_TTL_MS = parseInt(process.env.METRICS_STALE_TTL_MS || '900000', 10);
 
 function base64url(input) {
   return Buffer.from(input)
@@ -217,6 +220,21 @@ function resolveVerificationPostId(raw) {
 
 function normalizeText(v) {
   return String(v || '').replace(/\s+/g, ' ').trim();
+}
+
+function pickBestDexPair(pairs) {
+  if (!Array.isArray(pairs) || pairs.length === 0) return null;
+  const solanaPairs = pairs.filter((p) => String(p?.chainId || '').toLowerCase() === 'solana');
+  const list = solanaPairs.length > 0 ? solanaPairs : pairs;
+  const score = (pair) => {
+    const liquidity = Number(pair?.liquidity?.usd || 0);
+    const volume = Number(pair?.volume?.h24 || 0);
+    const txns =
+      Number(pair?.txns?.h24?.buys || 0) +
+      Number(pair?.txns?.h24?.sells || 0);
+    return liquidity * 10 + volume + txns * 100;
+  };
+  return list.sort((a, b) => score(b) - score(a))[0] || null;
 }
 
 const STARTUP_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
@@ -750,27 +768,43 @@ function normalizeSymbol(symbol) {
 app.get('/api/metrics/:mint', async (req, res) => {
   const { mint } = req.params;
   if (!mint) return res.status(400).json({ error: 'Missing mint' });
+  const now = Date.now();
+  const cacheKey = String(mint);
+  const cached = metricsCache.get(cacheKey);
+  if (cached && now - cached.fetchedAt <= METRICS_TTL_MS) {
+    return res.json({ success: true, data: cached.data, cached: true });
+  }
 
   try {
     const resp = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
       timeout: 15_000,
       headers: { 'User-Agent': 'ClawValley/1.0' },
     });
-    const pair = resp.data?.pairs?.[0];
-    if (!pair) return res.json({ success: true, data: null });
+    const pair = pickBestDexPair(resp.data?.pairs || []);
+    if (!pair) {
+      if (cached && now - cached.fetchedAt <= METRICS_STALE_TTL_MS) {
+        return res.json({ success: true, data: cached.data, cached: true, stale: true });
+      }
+      return res.json({ success: true, data: null });
+    }
 
+    const data = {
+      price: pair.priceUsd ? Number(pair.priceUsd) : null,
+      change24h: pair.priceChange?.h24 ?? null,
+      mcap: pair.fdv || pair.marketCap || null,
+      volume: pair.volume?.h24 || null,
+      url: pair.url || null,
+    };
+    metricsCache.set(cacheKey, { data, fetchedAt: now });
     res.json({
       success: true,
-      data: {
-        price: pair.priceUsd ? Number(pair.priceUsd) : null,
-        change24h: pair.priceChange?.h24 ?? null,
-        mcap: pair.fdv || pair.marketCap || null,
-        volume: pair.volume?.h24 || null,
-        url: pair.url || null,
-      },
+      data,
     });
   } catch (err) {
     console.error('GET /api/metrics/:mint failed:', err?.response?.data || err.message || err);
+    if (cached && now - cached.fetchedAt <= METRICS_STALE_TTL_MS) {
+      return res.json({ success: true, data: cached.data, cached: true, stale: true });
+    }
     res.status(502).json({ error: 'Failed to fetch metrics' });
   }
 });
