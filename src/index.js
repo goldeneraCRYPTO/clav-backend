@@ -43,6 +43,8 @@ const AUTH_ALLOW_LEGACY_HEADER = String(process.env.AUTH_ALLOW_LEGACY_HEADER || 
 const JWT_SECRET = process.env.JWT_SECRET || null;
 const APP_JWT_TTL_SECONDS = parseInt(process.env.APP_JWT_TTL_SECONDS || '3600', 10); // default 1h
 const AUTH_CHALLENGE_TTL_MS = parseInt(process.env.AUTH_CHALLENGE_TTL_MS || String(15 * 60 * 1000), 10); // default 15m
+const MOLTBOOK_API_BASE = process.env.MOLTBOOK_API_BASE || 'https://www.moltbook.com/api/v1';
+const MOLTBOOK_VERIFICATION_POST_ID = process.env.MOLTBOOK_VERIFICATION_POST_ID || '';
 
 function requireEnv(name, value) {
   if (!value) {
@@ -55,6 +57,9 @@ requireEnv('OPERATOR_WALLET (BAGS_WALLET_ADDRESS)', OPERATOR_WALLET);
 requireEnv('OPERATOR_PRIVATE_KEY (BAGS_PRIVATE_KEY)', OPERATOR_PRIVATE_KEY);
 if (!JWT_SECRET) {
   console.warn('⚠️ Missing JWT_SECRET. Agent auth endpoints will fail until it is set.');
+}
+if (!MOLTBOOK_VERIFICATION_POST_ID) {
+  console.warn('⚠️ Missing MOLTBOOK_VERIFICATION_POST_ID. Comment-based auth verification will be unavailable.');
 }
 
 if (BAGS_PARTNER_WALLET && BAGS_PARTNER_CONFIG) {
@@ -95,6 +100,7 @@ app.get('/health', (req, res) => {
 // AUTH HELPERS
 // ---------------------------------------------------------------------------
 const authSessions = new Map();
+const usedProofIds = new Set();
 
 function base64url(input) {
   return Buffer.from(input)
@@ -199,6 +205,61 @@ function cleanupExpiredAuthSessions() {
   }
 }
 
+function resolveVerificationPostId(raw) {
+  if (!raw) return null;
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    const m = raw.match(/\/posts\/([^/?#]+)/i);
+    return m ? m[1] : null;
+  }
+  return raw;
+}
+
+function normalizeText(v) {
+  return String(v || '').replace(/\s+/g, ' ').trim();
+}
+
+function extractCommentsArray(payload) {
+  if (Array.isArray(payload?.comments)) return payload.comments;
+  if (Array.isArray(payload?.data?.comments)) return payload.data.comments;
+  if (Array.isArray(payload?.response?.comments)) return payload.response.comments;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (Array.isArray(payload?.response)) return payload.response;
+  return [];
+}
+
+async function verifyChallengeByComment({ session, challengeId, commentId }) {
+  const postId = resolveVerificationPostId(MOLTBOOK_VERIFICATION_POST_ID);
+  if (!postId) {
+    return { ok: false, status: 500, error: 'Comment verification is not configured (missing MOLTBOOK_VERIFICATION_POST_ID)' };
+  }
+
+  const resp = await axios.get(`${MOLTBOOK_API_BASE}/posts/${postId}/comments`, {
+    timeout: 20_000,
+  });
+  const comments = extractCommentsArray(resp.data);
+  const comment = comments.find((c) => String(c?.id) === String(commentId));
+  if (!comment) return { ok: false, status: 401, error: 'Verification comment not found' };
+
+  const author = comment?.author?.name || comment?.author?.username || comment?.user?.name || comment?.username || null;
+  if (!author || String(author).toLowerCase() !== String(session.username).toLowerCase()) {
+    return { ok: false, status: 401, error: 'Comment author does not match challenge username' };
+  }
+
+  const content = normalizeText(comment?.content || comment?.text || comment?.message || '');
+  const expected = normalizeText(session.challenge);
+  if (!content.includes(expected)) {
+    return { ok: false, status: 401, error: 'Verification comment does not contain challenge text' };
+  }
+
+  const createdAt = comment?.created_at || comment?.createdAt || comment?.timestamp || null;
+  const createdMs = createdAt ? new Date(createdAt).getTime() : NaN;
+  if (Number.isFinite(createdMs) && createdMs < session.createdAt) {
+    return { ok: false, status: 401, error: 'Verification comment is older than challenge' };
+  }
+
+  return { ok: true, verifiedWith: 'moltbook-comment' };
+}
+
 // ---------------------------------------------------------------------------
 // ROUTES - AUTH (Moltbook via Bags challenge flow)
 // ---------------------------------------------------------------------------
@@ -233,6 +294,7 @@ app.post('/api/auth/init', async (req, res) => {
       username,
       secret,
       challenge,
+      createdAt: Date.now(),
       expiresAt,
       used: false,
     });
@@ -244,7 +306,7 @@ app.post('/api/auth/init', async (req, res) => {
         challengeText: challenge,
         expiresAt: new Date(expiresAt).toISOString(),
         provider: 'moltbook',
-        instruction: 'Post this exact challenge text from your Moltbook account, then call /api/auth/verify with challengeId and postId.',
+        instruction: 'Post this exact challenge text from your Moltbook account, then call /api/auth/verify with challengeId and either postId (Bags flow) or commentId (Moltbook comment flow).',
       },
     });
   } catch (err) {
@@ -264,7 +326,17 @@ app.post('/api/auth/verify', async (req, res) => {
 
     const body = z.object({
       challengeId: z.string().min(1),
-      postId: z.string().min(1),
+      postId: z.string().min(1).optional(),
+      commentId: z.string().min(1).optional(),
+      method: z.enum(['auto', 'bags', 'comment']).optional(),
+    }).superRefine((data, ctx) => {
+      if (!data.postId && !data.commentId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['postId'],
+          message: 'Provide postId or commentId',
+        });
+      }
     }).parse(req.body);
 
     const session = authSessions.get(body.challengeId);
@@ -275,29 +347,50 @@ app.post('/api/auth/verify', async (req, res) => {
       return res.status(400).json({ error: 'Challenge expired' });
     }
 
-    const bagsHeaders = { 'Content-Type': 'application/json' };
-    if (BAGS_API_KEY) bagsHeaders['x-api-key'] = BAGS_API_KEY;
-    const bagsResp = await axios.post(
-      `${BAGS_API_BASE}/agent/auth/login`,
-      {
-        publicIdentifier: body.challengeId,
-        secret: session.secret,
-        postId: body.postId,
-      },
-      { headers: bagsHeaders, timeout: 20_000 }
-    );
+    const method = body.method || (body.commentId ? 'comment' : 'bags');
+    let verifiedWith = null;
+    let proofKey = null;
 
-    if (!bagsResp.data?.success) {
-      return res.status(401).json({ error: bagsResp.data?.error || 'Challenge verification failed' });
+    if (method === 'comment' || (method === 'auto' && body.commentId)) {
+      const commentId = body.commentId;
+      if (!commentId) return res.status(400).json({ error: 'commentId is required for comment verification' });
+      proofKey = `comment:${commentId}`;
+      if (usedProofIds.has(proofKey)) return res.status(400).json({ error: 'This comment has already been used for verification' });
+      const commentVerify = await verifyChallengeByComment({ session, challengeId: body.challengeId, commentId });
+      if (!commentVerify.ok) return res.status(commentVerify.status).json({ error: commentVerify.error });
+      verifiedWith = commentVerify.verifiedWith;
+    } else {
+      const postId = body.postId;
+      if (!postId) return res.status(400).json({ error: 'postId is required for Bags verification' });
+      proofKey = `post:${postId}`;
+      if (usedProofIds.has(proofKey)) return res.status(400).json({ error: 'This postId has already been used for verification' });
+
+      const bagsHeaders = { 'Content-Type': 'application/json' };
+      if (BAGS_API_KEY) bagsHeaders['x-api-key'] = BAGS_API_KEY;
+      const bagsResp = await axios.post(
+        `${BAGS_API_BASE}/agent/auth/login`,
+        {
+          publicIdentifier: body.challengeId,
+          secret: session.secret,
+          postId,
+        },
+        { headers: bagsHeaders, timeout: 20_000 }
+      );
+
+      if (!bagsResp.data?.success) {
+        return res.status(401).json({ error: bagsResp.data?.error || 'Challenge verification failed' });
+      }
+      verifiedWith = 'bags-agent-auth';
     }
 
     session.used = true;
     authSessions.delete(body.challengeId);
+    if (proofKey) usedProofIds.add(proofKey);
 
     const appToken = signAppJwt({
       username: session.username,
       provider: 'moltbook',
-      verifiedWith: 'bags-agent-auth',
+      verifiedWith,
     });
 
     res.json({
@@ -306,6 +399,7 @@ app.post('/api/auth/verify', async (req, res) => {
       tokenType: 'Bearer',
       expiresIn: APP_JWT_TTL_SECONDS,
       username: session.username,
+      verifiedWith,
     });
   } catch (err) {
     console.error('POST /api/auth/verify failed:', err?.response?.data || err);
