@@ -110,6 +110,7 @@ const METRICS_STALE_TTL_MS = parseInt(process.env.METRICS_STALE_TTL_MS || '90000
 const LIKE_NONCE_TTL_MS = parseInt(process.env.LIKE_NONCE_TTL_MS || '600000', 10); // 10m
 const LIKE_IP_WINDOW_MS = parseInt(process.env.LIKE_IP_WINDOW_MS || '60000', 10); // 1m
 const LIKE_IP_MAX_PER_WINDOW = parseInt(process.env.LIKE_IP_MAX_PER_WINDOW || '30', 10);
+const STARTUP_MAX_PER_AGENT = parseInt(process.env.STARTUP_MAX_PER_AGENT || '3', 10);
 
 let startupLikesTableReadyPromise = null;
 
@@ -1031,6 +1032,40 @@ app.post('/api/startups/create', async (req, res) => {
     });
 
     const body = schema.parse(req.body);
+    const normalizedTitle = body.title.trim().toLowerCase();
+
+    const existingByTitle = await pool.query(
+      `
+      SELECT id
+      FROM startups
+      WHERE author_username = $1
+        AND LOWER(TRIM(title)) = $2
+      LIMIT 1
+      `,
+      [username, normalizedTitle]
+    );
+    if (existingByTitle.rows.length > 0) {
+      return res.status(409).json({
+        error: 'Startup with this title already exists for this agent',
+        code: 'DUPLICATE_STARTUP_TITLE',
+      });
+    }
+
+    if (Number.isFinite(STARTUP_MAX_PER_AGENT) && STARTUP_MAX_PER_AGENT > 0) {
+      const countRes = await pool.query(
+        'SELECT COUNT(*)::int AS count FROM startups WHERE author_username = $1',
+        [username]
+      );
+      const currentCount = countRes.rows[0]?.count || 0;
+      if (currentCount >= STARTUP_MAX_PER_AGENT) {
+        return res.status(409).json({
+          error: `Startup limit reached (${STARTUP_MAX_PER_AGENT} per agent)`,
+          code: 'STARTUP_LIMIT_REACHED',
+          limit: STARTUP_MAX_PER_AGENT,
+        });
+      }
+    }
+
     await validateStartupImageUrl(body.image);
 
     const result = await pool.query(
