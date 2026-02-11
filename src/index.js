@@ -23,6 +23,8 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const BAGS_API_BASE = process.env.BAGS_API_BASE || 'https://public-api-v2.bags.fm/api/v1';
 const BAGS_API_KEY = process.env.BAGS_API_KEY;
+const BIRDEYE_API_BASE = process.env.BIRDEYE_API_BASE || 'https://public-api.birdeye.so';
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY || null;
 const OPERATOR_WALLET = process.env.BAGS_WALLET_ADDRESS || process.env.OPERATOR_WALLET;
 const OPERATOR_PRIVATE_KEY = process.env.BAGS_PRIVATE_KEY || process.env.OPERATOR_PRIVATE_KEY;
 
@@ -56,6 +58,9 @@ function requireEnv(name, value) {
 requireEnv('BAGS_API_KEY', BAGS_API_KEY);
 requireEnv('OPERATOR_WALLET (BAGS_WALLET_ADDRESS)', OPERATOR_WALLET);
 requireEnv('OPERATOR_PRIVATE_KEY (BAGS_PRIVATE_KEY)', OPERATOR_PRIVATE_KEY);
+if (!BIRDEYE_API_KEY) {
+  console.warn('⚠️ Missing BIRDEYE_API_KEY. Metrics endpoint will use DexScreener only.');
+}
 if (!JWT_SECRET) {
   console.warn('⚠️ Missing JWT_SECRET. Agent auth endpoints will fail until it is set.');
 }
@@ -92,6 +97,7 @@ app.get('/health', (req, res) => {
     env: NODE_ENV,
     hasDb: !!process.env.DATABASE_URL,
     hasBagsKey: !!BAGS_API_KEY,
+    hasBirdeyeKey: !!BIRDEYE_API_KEY,
     operatorWallet: OPERATOR_WALLET ? `${OPERATOR_WALLET.slice(0, 4)}…${OPERATOR_WALLET.slice(-4)}` : null,
     rpc: SOLANA_RPC_URL,
   });
@@ -305,6 +311,96 @@ function pickBestDexPair(pairs) {
     return liquidity * 10 + volume + txns * 100;
   };
   return list.sort((a, b) => score(b) - score(a))[0] || null;
+}
+
+function toFiniteNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickFirstNumber(...values) {
+  for (const value of values) {
+    const n = toFiniteNumber(value);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
+async function fetchBirdeyeMetrics(mint) {
+  if (!BIRDEYE_API_KEY) return null;
+
+  const headers = {
+    'X-API-KEY': BIRDEYE_API_KEY,
+    'x-chain': 'solana',
+    accept: 'application/json',
+  };
+
+  const [priceRes, overviewRes] = await Promise.allSettled([
+    axios.get(`${BIRDEYE_API_BASE}/defi/price`, {
+      params: { address: mint },
+      headers,
+      timeout: 12_000,
+    }),
+    axios.get(`${BIRDEYE_API_BASE}/defi/token_overview`, {
+      params: { address: mint },
+      headers,
+      timeout: 12_000,
+    }),
+  ]);
+
+  const priceData = priceRes.status === 'fulfilled' ? priceRes.value?.data?.data || null : null;
+  const overviewData = overviewRes.status === 'fulfilled' ? overviewRes.value?.data?.data || null : null;
+
+  if (!priceData && !overviewData) return null;
+
+  const data = {
+    price: pickFirstNumber(
+      priceData?.value,
+      priceData?.price,
+      overviewData?.price,
+      overviewData?.priceUsd
+    ),
+    change24h: pickFirstNumber(
+      overviewData?.price_change_24h_percent,
+      overviewData?.price_change_24h,
+      overviewData?.priceChange24h,
+      overviewData?.priceChange24hPercent
+    ),
+    mcap: pickFirstNumber(
+      overviewData?.market_cap,
+      overviewData?.marketcap,
+      overviewData?.mc,
+      overviewData?.fdv
+    ),
+    volume: pickFirstNumber(
+      overviewData?.volume_24h_usd,
+      overviewData?.volume24hUSD,
+      overviewData?.v24hUSD,
+      overviewData?.v24h
+    ),
+    url: `https://birdeye.so/token/${mint}?chain=solana`,
+  };
+
+  // Consider Birdeye response useful only if at least one metric is present.
+  if (data.price === null && data.mcap === null && data.volume === null) return null;
+  return data;
+}
+
+async function fetchDexscreenerMetrics(mint) {
+  const resp = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
+    timeout: 15_000,
+    headers: { 'User-Agent': 'AgentValley/1.0' },
+  });
+  const pair = pickBestDexPair(resp.data?.pairs || []);
+  if (!pair) return null;
+  return {
+    price: pair.priceUsd ? Number(pair.priceUsd) : null,
+    change24h: pair.priceChange?.h24 ?? null,
+    mcap: pair.fdv || pair.marketCap || null,
+    volume: pair.volume?.h24 || null,
+    url: pair.url || null,
+  };
 }
 
 const STARTUP_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
@@ -846,29 +942,35 @@ app.get('/api/metrics/:mint', async (req, res) => {
   }
 
   try {
-    const resp = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
-      timeout: 15_000,
-      headers: { 'User-Agent': 'AgentValley/1.0' },
-    });
-    const pair = pickBestDexPair(resp.data?.pairs || []);
-    if (!pair) {
+    let data = null;
+    let source = null;
+
+    try {
+      data = await fetchBirdeyeMetrics(mint);
+      if (data) source = 'birdeye';
+    } catch (birdeyeErr) {
+      const birdeyeDetails =
+        birdeyeErr?.response?.data || birdeyeErr?.message || birdeyeErr;
+      console.warn('Birdeye metrics fetch failed:', birdeyeDetails);
+    }
+
+    if (!data) {
+      data = await fetchDexscreenerMetrics(mint);
+      if (data) source = 'dexscreener';
+    }
+
+    if (!data) {
       if (cached && now - cached.fetchedAt <= METRICS_STALE_TTL_MS) {
         return res.json({ success: true, data: cached.data, cached: true, stale: true });
       }
       return res.json({ success: true, data: null });
     }
 
-    const data = {
-      price: pair.priceUsd ? Number(pair.priceUsd) : null,
-      change24h: pair.priceChange?.h24 ?? null,
-      mcap: pair.fdv || pair.marketCap || null,
-      volume: pair.volume?.h24 || null,
-      url: pair.url || null,
-    };
     metricsCache.set(cacheKey, { data, fetchedAt: now });
     res.json({
       success: true,
       data,
+      source,
     });
   } catch (err) {
     console.error('GET /api/metrics/:mint failed:', err?.response?.data || err.message || err);
