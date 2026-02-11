@@ -103,8 +103,15 @@ app.get('/health', (req, res) => {
 const authSessions = new Map();
 const usedProofIds = new Set();
 const metricsCache = new Map();
+const usedLikeNonces = new Map();
+const likeRateByIp = new Map();
 const METRICS_TTL_MS = parseInt(process.env.METRICS_TTL_MS || '60000', 10);
 const METRICS_STALE_TTL_MS = parseInt(process.env.METRICS_STALE_TTL_MS || '900000', 10);
+const LIKE_NONCE_TTL_MS = parseInt(process.env.LIKE_NONCE_TTL_MS || '600000', 10); // 10m
+const LIKE_IP_WINDOW_MS = parseInt(process.env.LIKE_IP_WINDOW_MS || '60000', 10); // 1m
+const LIKE_IP_MAX_PER_WINDOW = parseInt(process.env.LIKE_IP_MAX_PER_WINDOW || '30', 10);
+
+let startupLikesTableReadyPromise = null;
 
 function base64url(input) {
   return Buffer.from(input)
@@ -220,6 +227,68 @@ function resolveVerificationPostId(raw) {
 
 function normalizeText(v) {
   return String(v || '').replace(/\s+/g, ' ').trim();
+}
+
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.length > 0) return xff.split(',')[0].trim();
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function allowLikeForIp(ip) {
+  const now = Date.now();
+  const list = likeRateByIp.get(ip) || [];
+  const recent = list.filter((ts) => now - ts <= LIKE_IP_WINDOW_MS);
+  if (recent.length >= LIKE_IP_MAX_PER_WINDOW) {
+    likeRateByIp.set(ip, recent);
+    return false;
+  }
+  recent.push(now);
+  likeRateByIp.set(ip, recent);
+  return true;
+}
+
+function isLikeNonceUsed(clientId, startupId, nonce) {
+  const key = `${clientId}:${startupId}:${nonce}`;
+  const exp = usedLikeNonces.get(key);
+  if (!exp) return false;
+  if (Date.now() > exp) {
+    usedLikeNonces.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function rememberLikeNonce(clientId, startupId, nonce) {
+  const key = `${clientId}:${startupId}:${nonce}`;
+  usedLikeNonces.set(key, Date.now() + LIKE_NONCE_TTL_MS);
+}
+
+function cleanupLikeNonceCache() {
+  const now = Date.now();
+  for (const [key, exp] of usedLikeNonces.entries()) {
+    if (exp <= now) usedLikeNonces.delete(key);
+  }
+}
+
+async function ensureStartupLikesTable() {
+  if (startupLikesTableReadyPromise) return startupLikesTableReadyPromise;
+  startupLikesTableReadyPromise = (async () => {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS startup_likes (
+        id SERIAL PRIMARY KEY,
+        startup_id INTEGER REFERENCES startups(id) ON DELETE CASCADE,
+        client_id VARCHAR(255) NOT NULL,
+        ip_address VARCHAR(255),
+        last_nonce VARCHAR(255),
+        liked_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(startup_id, client_id)
+      );
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_startup_likes_startup_id ON startup_likes(startup_id);');
+    await pool.query('CREATE INDEX IF NOT EXISTS idx_startup_likes_ip ON startup_likes(ip_address);');
+  })();
+  return startupLikesTableReadyPromise;
 }
 
 function pickBestDexPair(pairs) {
@@ -857,13 +926,77 @@ app.get('/api/startups/:id', async (req, res) => {
 });
 
 app.post('/api/startups/:id/like', async (req, res) => {
+  let dbClient = null;
   try {
-    const { id } = req.params;
-    await pool.query('UPDATE startups SET likes = likes + 1 WHERE id = $1', [id]);
-    res.json({ success: true });
+    await ensureStartupLikesTable();
+    cleanupLikeNonceCache();
+
+    const startupId = Number(req.params.id);
+    if (!Number.isInteger(startupId) || startupId <= 0) {
+      return res.status(400).json({ error: 'Invalid startup id' });
+    }
+
+    const clientId = String(req.headers['x-client-id'] || '').trim();
+    const nonce = String(req.headers['x-like-nonce'] || '').trim();
+    const ip = getClientIp(req);
+
+    if (!clientId || clientId.length < 8) {
+      return res.status(400).json({ error: 'Missing or invalid x-client-id' });
+    }
+    if (!nonce || nonce.length < 8) {
+      return res.status(400).json({ error: 'Missing or invalid x-like-nonce' });
+    }
+    if (!allowLikeForIp(ip)) {
+      return res.status(429).json({ error: 'Too many like requests from this IP. Try again later.' });
+    }
+    if (isLikeNonceUsed(clientId, startupId, nonce)) {
+      return res.status(409).json({ error: 'Duplicate like nonce' });
+    }
+
+    dbClient = await pool.connect();
+    await dbClient.query('BEGIN');
+
+    const startup = await dbClient.query('SELECT id FROM startups WHERE id = $1 FOR UPDATE', [startupId]);
+    if (startup.rows.length === 0) {
+      await dbClient.query('ROLLBACK');
+      return res.status(404).json({ error: 'Startup not found' });
+    }
+
+    const existing = await dbClient.query(
+      'SELECT id FROM startup_likes WHERE startup_id = $1 AND client_id = $2',
+      [startupId, clientId]
+    );
+
+    let liked = false;
+    if (existing.rows.length > 0) {
+      await dbClient.query('DELETE FROM startup_likes WHERE startup_id = $1 AND client_id = $2', [startupId, clientId]);
+      liked = false;
+    } else {
+      await dbClient.query(
+        'INSERT INTO startup_likes (startup_id, client_id, ip_address, last_nonce) VALUES ($1, $2, $3, $4)',
+        [startupId, clientId, ip, nonce]
+      );
+      liked = true;
+    }
+
+    const countResult = await dbClient.query(
+      'SELECT COUNT(*)::int AS count FROM startup_likes WHERE startup_id = $1',
+      [startupId]
+    );
+    const likes = countResult.rows[0]?.count ?? 0;
+    await dbClient.query('UPDATE startups SET likes = $1 WHERE id = $2', [likes, startupId]);
+
+    await dbClient.query('COMMIT');
+    rememberLikeNonce(clientId, startupId, nonce);
+    res.json({ success: true, liked, likes });
   } catch (err) {
+    if (dbClient) {
+      try { await dbClient.query('ROLLBACK'); } catch (_) {}
+    }
     console.error('POST /api/startups/:id/like failed:', err);
     res.status(500).json({ error: 'Failed to like startup' });
+  } finally {
+    if (dbClient) dbClient.release();
   }
 });
 
@@ -1193,12 +1326,12 @@ app.post('/api/tokens/:id/chat', async (req, res) => {
       message: z.string().min(1).max(2000),
     });
     const body = schema.parse(req.body);
+    const token = await pool.query('SELECT startup_id FROM tokens WHERE id = $1', [id]);
+    if (token.rows.length === 0) return res.status(404).json({ error: 'Token not found' });
+    const startupId = token.rows[0].startup_id;
 
     let author = username;
     if (author) {
-      const token = await pool.query('SELECT startup_id FROM tokens WHERE id = $1', [id]);
-      if (token.rows.length === 0) return res.status(404).json({ error: 'Token not found' });
-      const startupId = token.rows[0].startup_id;
       const isMember = await pool.query(
         'SELECT 1 FROM teams WHERE startup_id = $1 AND bot_username = $2',
         [startupId, author]
@@ -1206,7 +1339,16 @@ app.post('/api/tokens/:id/chat', async (req, res) => {
       if (isMember.rows.length === 0) return res.status(403).json({ error: 'Only team bots can post as bots' });
     } else {
       if (!body.name) return res.status(400).json({ error: 'Missing name' });
-      author = body.name;
+      const requestedName = body.name.trim();
+      const teamNames = await pool.query(
+        'SELECT bot_username FROM teams WHERE startup_id = $1',
+        [startupId]
+      );
+      const reserved = new Set(teamNames.rows.map((r) => String(r.bot_username || '').toLowerCase()));
+      if (reserved.has(requestedName.toLowerCase())) {
+        return res.status(403).json({ error: 'This name is reserved for team bots' });
+      }
+      author = requestedName;
     }
 
     const result = await pool.query(

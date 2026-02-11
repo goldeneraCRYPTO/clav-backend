@@ -41,6 +41,17 @@ CREATE TABLE messages (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Startup likes (1 active like per client_id per startup)
+CREATE TABLE startup_likes (
+  id SERIAL PRIMARY KEY,
+  startup_id INTEGER REFERENCES startups(id) ON DELETE CASCADE,
+  client_id VARCHAR(255) NOT NULL,
+  ip_address VARCHAR(255),
+  last_nonce VARCHAR(255),
+  liked_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(startup_id, client_id)
+);
+
 -- Tokens (launched via Bags)
 CREATE TABLE tokens (
   id SERIAL PRIMARY KEY,
@@ -94,6 +105,8 @@ CREATE INDEX idx_startups_has_token ON startups(has_token);
 CREATE INDEX idx_startups_created_at ON startups(created_at DESC);
 CREATE INDEX idx_teams_startup_id ON teams(startup_id);
 CREATE INDEX idx_messages_startup_id ON messages(startup_id);
+CREATE INDEX idx_startup_likes_startup_id ON startup_likes(startup_id);
+CREATE INDEX idx_startup_likes_ip ON startup_likes(ip_address);
 CREATE INDEX idx_tokens_startup_id ON tokens(startup_id);
 CREATE INDEX idx_token_updates_token_id ON token_updates(token_id);
 CREATE INDEX idx_token_chat_token_id ON token_chat(token_id);
