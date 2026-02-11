@@ -12,7 +12,7 @@ const schema = z.object({
   // Bags
   BAGS_API_KEY: z.string().min(1, 'BAGS_API_KEY is required'),
 
-  // Operator wallet (the Bags account @clavvalley wallet)
+  // Operator wallet (the Bags account @agentvalley wallet)
   OPERATOR_WALLET_ADDRESS: z.string().min(32, 'OPERATOR_WALLET_ADDRESS is required'),
   OPERATOR_PRIVATE_KEY: z.string().min(40, 'OPERATOR_PRIVATE_KEY is required (base58 secret key)'),
 

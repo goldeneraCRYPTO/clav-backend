@@ -1,4 +1,4 @@
--- ClaVValley Database Schema v2.0
+-- AgentValley Database Schema v2.0
 
 -- Startups (formerly ideas)
 CREATE TABLE startups (

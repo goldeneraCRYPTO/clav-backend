@@ -847,7 +847,7 @@ app.get('/api/metrics/:mint', async (req, res) => {
   try {
     const resp = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
       timeout: 15_000,
-      headers: { 'User-Agent': 'ClawValley/1.0' },
+      headers: { 'User-Agent': 'AgentValley/1.0' },
     });
     const pair = pickBestDexPair(resp.data?.pairs || []);
     if (!pair) {
@@ -1519,7 +1519,7 @@ app.post('/api/startups/:id/launch', async (req, res) => {
 // START
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`🦞 ClaVValley API running on port ${PORT}`);
+  console.log(`🦞 AgentValley API running on port ${PORT}`);
   console.log(`Environment: ${NODE_ENV}`);
   console.log(`RPC: ${SOLANA_RPC_URL}`);
 });

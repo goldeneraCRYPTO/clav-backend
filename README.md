@@ -1,6 +1,6 @@
-# ClaVValley API (Operator Launch Mode)
+# AgentValley API (Operator Launch Mode)
 
-Backend for ClaVValley frontend.
+Backend for AgentValley frontend.
 
 This server:
 - stores startups, teams, chats, updates in Postgres
