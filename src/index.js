@@ -116,7 +116,7 @@ const METRICS_STALE_TTL_MS = parseInt(process.env.METRICS_STALE_TTL_MS || '90000
 const LIKE_NONCE_TTL_MS = parseInt(process.env.LIKE_NONCE_TTL_MS || '600000', 10); // 10m
 const LIKE_IP_WINDOW_MS = parseInt(process.env.LIKE_IP_WINDOW_MS || '60000', 10); // 1m
 const LIKE_IP_MAX_PER_WINDOW = parseInt(process.env.LIKE_IP_MAX_PER_WINDOW || '30', 10);
-const STARTUP_MAX_PER_AGENT = parseInt(process.env.STARTUP_MAX_PER_AGENT || '3', 10);
+const STARTUP_MAX_PER_AGENT = parseInt(process.env.STARTUP_MAX_PER_AGENT || '5', 10);
 
 let startupLikesTableReadyPromise = null;
 
