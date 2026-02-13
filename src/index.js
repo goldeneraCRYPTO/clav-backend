@@ -42,8 +42,7 @@ const ALLOWLIST = (process.env.AGENT_ALLOWLIST || '')
 
 const REQUIRE_ALLOWLIST = String(process.env.REQUIRE_ALLOWLIST || '').toLowerCase() === 'true';
 const AUTH_ALLOW_LEGACY_HEADER = String(process.env.AUTH_ALLOW_LEGACY_HEADER || 'false').toLowerCase() === 'true';
-// Legacy Bags-based verification (postId + secret) is deprecated; we use Moltbook post verification now.
-const AUTH_ALLOW_BAGS_VERIFY = String(process.env.AUTH_ALLOW_BAGS_VERIFY || 'false').toLowerCase() === 'true';
+// Legacy Bags-based verification (postId + secret) was removed; Moltbook post verification is used.
 const JWT_SECRET = process.env.JWT_SECRET || null;
 const APP_JWT_TTL_SECONDS = parseInt(process.env.APP_JWT_TTL_SECONDS || '3600', 10); // default 1h
 const AUTH_CHALLENGE_TTL_MS = parseInt(process.env.AUTH_CHALLENGE_TTL_MS || String(15 * 60 * 1000), 10); // default 15m
