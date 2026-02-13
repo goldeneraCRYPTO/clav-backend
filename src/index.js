@@ -42,12 +42,12 @@ const ALLOWLIST = (process.env.AGENT_ALLOWLIST || '')
 
 const REQUIRE_ALLOWLIST = String(process.env.REQUIRE_ALLOWLIST || '').toLowerCase() === 'true';
 const AUTH_ALLOW_LEGACY_HEADER = String(process.env.AUTH_ALLOW_LEGACY_HEADER || 'false').toLowerCase() === 'true';
+// Legacy Bags-based verification (postId + secret) is deprecated; we use Moltbook post verification now.
 const AUTH_ALLOW_BAGS_VERIFY = String(process.env.AUTH_ALLOW_BAGS_VERIFY || 'false').toLowerCase() === 'true';
 const JWT_SECRET = process.env.JWT_SECRET || null;
 const APP_JWT_TTL_SECONDS = parseInt(process.env.APP_JWT_TTL_SECONDS || '3600', 10); // default 1h
 const AUTH_CHALLENGE_TTL_MS = parseInt(process.env.AUTH_CHALLENGE_TTL_MS || String(15 * 60 * 1000), 10); // default 15m
 const MOLTBOOK_API_BASE = process.env.MOLTBOOK_API_BASE || 'https://www.moltbook.com/api/v1';
-const MOLTBOOK_VERIFICATION_POST_ID = process.env.MOLTBOOK_VERIFICATION_POST_ID || '';
 
 function requireEnv(name, value) {
   if (!value) {
@@ -63,9 +63,6 @@ if (!BIRDEYE_API_KEY) {
 }
 if (!JWT_SECRET) {
   console.warn('⚠️ Missing JWT_SECRET. Agent auth endpoints will fail until it is set.');
-}
-if (!MOLTBOOK_VERIFICATION_POST_ID) {
-  console.warn('⚠️ Missing MOLTBOOK_VERIFICATION_POST_ID. Comment-based auth verification will be unavailable.');
 }
 
 if (BAGS_PARTNER_WALLET && BAGS_PARTNER_CONFIG) {
@@ -221,15 +218,6 @@ function cleanupExpiredAuthSessions() {
   for (const [id, session] of authSessions.entries()) {
     if (session.expiresAt <= now || session.used) authSessions.delete(id);
   }
-}
-
-function resolveVerificationPostId(raw) {
-  if (!raw) return null;
-  if (raw.startsWith('http://') || raw.startsWith('https://')) {
-    const m = raw.match(/\/posts\/([^/?#]+)/i);
-    return m ? m[1] : null;
-  }
-  return raw;
 }
 
 function normalizeText(v) {
@@ -555,50 +543,46 @@ async function validateStartupImageUrl(imageUrl) {
   };
 }
 
-function extractCommentsArray(payload) {
-  if (Array.isArray(payload?.comments)) return payload.comments;
-  if (Array.isArray(payload?.data?.comments)) return payload.data.comments;
-  if (Array.isArray(payload?.response?.comments)) return payload.response.comments;
-  if (Array.isArray(payload?.data)) return payload.data;
-  if (Array.isArray(payload?.response)) return payload.response;
-  return [];
+function extractPostObject(payload) {
+  if (!payload) return null;
+  if (payload?.id || payload?.post_id) return payload;
+  if (payload?.post && (payload.post.id || payload.post.post_id)) return payload.post;
+  if (payload?.data && (payload.data.id || payload.data.post_id)) return payload.data;
+  if (payload?.response && (payload.response.id || payload.response.post_id)) return payload.response;
+  if (payload?.data?.post && (payload.data.post.id || payload.data.post.post_id)) return payload.data.post;
+  if (payload?.response?.post && (payload.response.post.id || payload.response.post.post_id)) return payload.response.post;
+  return null;
 }
 
-async function verifyChallengeByComment({ session, challengeId, commentId }) {
-  const postId = resolveVerificationPostId(MOLTBOOK_VERIFICATION_POST_ID);
-  if (!postId) {
-    return { ok: false, status: 500, error: 'Comment verification is not configured (missing MOLTBOOK_VERIFICATION_POST_ID)' };
-  }
-
-  const resp = await axios.get(`${MOLTBOOK_API_BASE}/posts/${postId}/comments`, {
+async function verifyChallengeByPost({ session, postId }) {
+  const resp = await axios.get(`${MOLTBOOK_API_BASE}/posts/${postId}`, {
     timeout: 20_000,
   });
-  const comments = extractCommentsArray(resp.data);
-  const comment = comments.find((c) => String(c?.id) === String(commentId));
-  if (!comment) return { ok: false, status: 401, error: 'Verification comment not found' };
+  const post = extractPostObject(resp.data);
+  if (!post) return { ok: false, status: 401, error: 'Verification post not found' };
 
-  const author = comment?.author?.name || comment?.author?.username || comment?.user?.name || comment?.username || null;
+  const author = post?.author?.name || post?.author?.username || post?.user?.name || post?.username || null;
   if (!author || String(author).toLowerCase() !== String(session.username).toLowerCase()) {
-    return { ok: false, status: 401, error: 'Comment author does not match challenge username' };
+    return { ok: false, status: 401, error: 'Post author does not match challenge username' };
   }
 
-  const content = normalizeText(comment?.content || comment?.text || comment?.message || '');
+  const content = normalizeText(post?.content || post?.text || post?.message || post?.body || '');
   const expected = normalizeText(session.challenge);
   if (!content.includes(expected)) {
-    return { ok: false, status: 401, error: 'Verification comment does not contain challenge text' };
+    return { ok: false, status: 401, error: 'Verification post does not contain challenge text' };
   }
 
-  const createdAt = comment?.created_at || comment?.createdAt || comment?.timestamp || null;
+  const createdAt = post?.created_at || post?.createdAt || post?.timestamp || null;
   const createdMs = createdAt ? new Date(createdAt).getTime() : NaN;
   if (Number.isFinite(createdMs) && createdMs < session.createdAt) {
-    return { ok: false, status: 401, error: 'Verification comment is older than challenge' };
+    return { ok: false, status: 401, error: 'Verification post is older than challenge' };
   }
 
-  return { ok: true, verifiedWith: 'moltbook-comment' };
+  return { ok: true, verifiedWith: 'moltbook-post' };
 }
 
 // ---------------------------------------------------------------------------
-// ROUTES - AUTH (Moltbook comment challenge flow)
+// ROUTES - AUTH (Moltbook post challenge flow)
 // ---------------------------------------------------------------------------
 app.post('/api/auth/init', async (req, res) => {
   try {
@@ -625,9 +609,7 @@ app.post('/api/auth/init', async (req, res) => {
         challengeText: challenge,
         expiresAt: new Date(expiresAt).toISOString(),
         provider: 'moltbook',
-        instruction: AUTH_ALLOW_BAGS_VERIFY
-          ? 'Post this exact challenge text from your Moltbook account, then call /api/auth/verify with challengeId and either postId (Bags flow) or commentId (Moltbook comment flow).'
-          : 'Post this exact challenge text as a comment from your Moltbook account, then call /api/auth/verify with challengeId and commentId.',
+        instruction: 'Post this exact challenge text from your Moltbook account, then call /api/auth/verify with challengeId and postId.',
       },
     });
   } catch (err) {
@@ -647,15 +629,14 @@ app.post('/api/auth/verify', async (req, res) => {
 
     const body = z.object({
       challengeId: z.string().min(1),
-      postId: z.string().min(1).optional(),
-      commentId: z.string().min(1).optional(),
-      method: z.enum(['auto', 'bags', 'comment']).optional(),
+      postId: z.string().min(1),
+      method: z.enum(['auto', 'post']).optional(),
     }).superRefine((data, ctx) => {
-      if (!data.postId && !data.commentId) {
+      if (!data.postId) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['postId'],
-          message: 'Provide postId or commentId',
+          message: 'Provide postId',
         });
       }
     }).parse(req.body);
@@ -668,47 +649,19 @@ app.post('/api/auth/verify', async (req, res) => {
       return res.status(400).json({ error: 'Challenge expired' });
     }
 
-    const method = body.method || (body.commentId ? 'comment' : 'bags');
+    const method = body.method || 'post';
     let verifiedWith = null;
     let proofKey = null;
 
-    if (method === 'comment' || (method === 'auto' && body.commentId)) {
-      const commentId = body.commentId;
-      if (!commentId) return res.status(400).json({ error: 'commentId is required for comment verification' });
-      proofKey = `comment:${commentId}`;
-      if (usedProofIds.has(proofKey)) return res.status(400).json({ error: 'This comment has already been used for verification' });
-      const commentVerify = await verifyChallengeByComment({ session, challengeId: body.challengeId, commentId });
-      if (!commentVerify.ok) return res.status(commentVerify.status).json({ error: commentVerify.error });
-      verifiedWith = commentVerify.verifiedWith;
-    } else {
-      if (!AUTH_ALLOW_BAGS_VERIFY) {
-        return res.status(403).json({ error: 'Bags verification method is disabled. Use commentId flow.' });
-      }
-      if (!session.secret) {
-        return res.status(400).json({ error: 'Bags verification is unavailable for this challenge. Use commentId flow.' });
-      }
-      const postId = body.postId;
-      if (!postId) return res.status(400).json({ error: 'postId is required for Bags verification' });
-      proofKey = `post:${postId}`;
-      if (usedProofIds.has(proofKey)) return res.status(400).json({ error: 'This postId has already been used for verification' });
-
-      const bagsHeaders = { 'Content-Type': 'application/json' };
-      if (BAGS_API_KEY) bagsHeaders['x-api-key'] = BAGS_API_KEY;
-      const bagsResp = await axios.post(
-        `${BAGS_API_BASE}/agent/auth/login`,
-        {
-          publicIdentifier: body.challengeId,
-          secret: session.secret,
-          postId,
-        },
-        { headers: bagsHeaders, timeout: 20_000 }
-      );
-
-      if (!bagsResp.data?.success) {
-        return res.status(401).json({ error: bagsResp.data?.error || 'Challenge verification failed' });
-      }
-      verifiedWith = 'bags-agent-auth';
+    if (method !== 'post' && method !== 'auto') {
+      return res.status(400).json({ error: 'Unsupported verification method' });
     }
+    const postId = body.postId;
+    proofKey = `post:${postId}`;
+    if (usedProofIds.has(proofKey)) return res.status(400).json({ error: 'This postId has already been used for verification' });
+    const postVerify = await verifyChallengeByPost({ session, postId });
+    if (!postVerify.ok) return res.status(postVerify.status).json({ error: postVerify.error });
+    verifiedWith = postVerify.verifiedWith;
 
     session.used = true;
     authSessions.delete(body.challengeId);
